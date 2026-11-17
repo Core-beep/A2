@@ -22,6 +22,35 @@ Address_t *my_address;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 
+
+
+/*
+Reusable signature function for salting signatures, takes 4 arguments: password we want to hash, how many bytes password is,
+ salt to combine with passwrd, where signature is stored (my_address).
+*/
+//-----------------------------------------------------------------------------------------------
+void get_signature(const char *password, int password_len, const char *salt, hashdata_t hash) {
+    char salted_input[2 * PASSWORD_LEN + 2 * SALT_LEN + 16];
+
+    int input_length = snprintf(
+        salted_input,
+        sizeof(salted_input),
+        "b'%.*s'b'%.*s'",
+        password_len, password,
+        SALT_LEN,
+        salt
+    );
+
+    if (input_length < 0 || (size_t)input_length >= sizeof(salted_input)) {
+        fprintf(stderr, "Failed to salt password!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    get_data_sha(salted_input, hash, (uint32_t)input_length, SHA256_HASH_SIZE);
+}
+
+//-----------------------------------------------------------------------------------------------
+
 /*
  * Send a request message to another peer on the network. Unless this is 
  * specifically an 'inform' message as described in the assignment handout, a 
@@ -205,7 +234,7 @@ int main(int argc, char **argv)
 
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
-    char user_salt[SALT_LEN+1] = "0123456789ABCDEF\0";
+    char user_salt[SALT_LEN+1] = "0123456789ABCDEF";                             // Removed "\0" from "..EF\0".
     //generate_random_salt(user_salt);
     memcpy(my_address->salt, user_salt, SALT_LEN);
 
@@ -214,6 +243,25 @@ int main(int argc, char **argv)
     After determining our salt but before saving our address we should probably
     work out what our signature should be. 
     */
+
+    //----------------------------------------------------------------------------
+    get_signature(password, strlen(password), my_address->salt, my_address->signature);
+
+
+    // Test by printing generated signature as hexadecimal characters
+    printf("Gernerated signature: ");
+
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) {
+        printf("%02x", my_address->signature[i]);
+    }
+
+    printf("\n");
+
+    //----------------------------------------------------------------------------
+
+
+
+
 
     // Start our record of the network by recording our own address. Make sure
     // any time we update this array we also update the peer_count.
