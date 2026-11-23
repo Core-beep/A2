@@ -152,6 +152,9 @@ void* handle_server_request_thread(void *vargp)
     compsys_helper_state_t state;
 
     int connfd = *((int *)vargp);
+
+    printf("Handler thread started fir connection %d \n", connfd); // check that incoming connections reach the handler.
+
     pthread_detach(pthread_self()); 
     free(vargp);
 
@@ -171,7 +174,7 @@ void* handle_server_request_thread(void *vargp)
  */
 void* server_thread()
 {
-    int listenfd;
+    int listenfd; // file descriptor. Used to identify an open resource, such as a socket.
     
     // Start listening
     char port_char[6];
@@ -188,6 +191,54 @@ void* server_thread()
     connections. The function 'handle_server_request_thread' has been provided
     as a simple skeleton function you could use to process your requests in.
     */
+
+    //-----------------------------------------------------------------------------------------------
+    /*
+    Continuously accepts connection from other peer.
+    Each connection is handled by a seperate thread so that the
+    server can accept new connections whil etheothers are processed.
+    */
+
+    while (1) {
+
+        // Allocate memory for the new connection's file descriptor
+        // Each handler thread needs its own copy
+        int * connfd = malloc(sizeof(int));
+
+        if (connfd == NULL) {
+            perror("malloc failed");
+            continue;
+        }
+
+        // Wait for another peer to connect
+        *connfd = accept(listenfd, NULL, NULL); // returns a new file descriptor representing that particular connection.
+
+        if (*connfd < 0) {
+            perror("accept failed");
+            free(connfd);
+            continue;
+        }
+
+
+        // Create a thread to handle this connection
+        pthread_t thread_id;
+
+        if (pthread_create(&thread_id, NULL, handle_server_request_thread, connfd) != 0) {
+            perror("pthread_create failed");
+            close(*connfd);
+            free(connfd);
+        }
+    }
+
+
+
+
+
+
+
+    //-----------------------------------------------------------------------------------------------
+
+
 
     // You should never see this printed in your finished implementation
     printf("Server thread done\n");
