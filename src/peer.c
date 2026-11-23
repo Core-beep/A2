@@ -16,6 +16,12 @@
 #include "./peer.h"
 
 
+//-----------------------------------     <- Beginning of code
+//...................................     <- end of code
+
+
+
+
 // Global variables to be used by both the server and client side of the peer.
 Address_t *my_address;
 
@@ -49,7 +55,7 @@ void get_signature(const char *password, int password_len, const char *salt, has
     get_data_sha(salted_input, hash, (uint32_t)input_length, SHA256_HASH_SIZE);
 }
 
-//-----------------------------------------------------------------------------------------------
+//................................................................................................
 
 /*
  * Send a request message to another peer on the network. Unless this is 
@@ -142,31 +148,117 @@ void* client_thread()
     return NULL;
 }
 
+
+//-----------------------------------------------------------------------------------------------
 /*
- * Handler for all server requests. This will call the relevent function based 
- * on the parsed command code
+ Handle one incoming connection from another peer.
+
+ Reads the request header, extracts it's fields and reads
+ the request body, if tere is one.
+
+ Parameter: vargp, a pointer to the accepted connection descriptor
+ Returns: NULL, when the conection has been handled.
  */
 void* handle_server_request_thread(void *vargp)
 {
-    char buf[MAXLINE];
-    compsys_helper_state_t state;
-
+    // Get the connection descriptor passed by the server thread.
     int connfd = *((int *)vargp);
 
-    printf("Handler thread started fir connection %d \n", connfd); // check that incoming connections reach the handler.
-
-    pthread_detach(pthread_self()); 
+    // Detatch the thread and free the allocated argument.
+    pthread_detach(pthread_self());
     free(vargp);
 
+    // Set up the buffered socket reader.
+    compsys_helper_state_t state;
+    compsys_helper_readinitb(&state, connfd);
+
+    // Read the fixed size request header (total of 60 bytes)
+    char header_buf[REQUEST_HEADER_LEN];
+
+    ssize_t bytes_read = compsys_helper_readnb(&state, header_buf, REQUEST_HEADER_LEN);
+
+    if (bytes_read != REQUEST_HEADER_LEN) {
+        fprintf(stderr, "Failed to read request header \n");
+        close(connfd);
+        return NULL;
+    }
+
+    // Extract the fields from the recieved header
+    RequestHeader_t request;
+
+    memcpy(request.ip, header_buf, IP_LEN);
+
+    // Store IP iun a null-terminated buffer for safe printing.
+    char sender_ip[IP_LEN + 1];
+    memcpy(sender_ip, request.ip, IP_LEN);
+    sender_ip[IP_LEN] = '\0';
+
+    //Numeric values are transmitted in network byte order.
+    uint32_t number;
+
+    memcpy(&number, header_buf + 16, sizeof(number));
+    request.port = ntohl(number);
+
+    memcpy(request.signature, header_buf + 20, SHA256_HASH_SIZE);
+
+    memcpy(&number, header_buf + 52, sizeof(number));
+    request.command = ntohl(number);
+
+    memcpy(&number, header_buf + 56, sizeof(number));
+    request.length = ntohl(number);
+
+
+    // Check that the command is one of the defined types.
+    if (request.command < COMMAND_REGISTER || request.command > COMMAND_INFORM) {
+        fprintf(stderr, "Invalid request command! \n");
+        close(connfd);
+        return NULL;
+    }
+
+
+    // make sure the request body fits our own buffer
+    if (request.length > MAX_MSG_LEN - REQUEST_HEADER_LEN) {
+        fprintf(stderr, "Request body too large! \n");
+        close(connfd);
+        return NULL;
+    }
+
+
+    // Read the body, body may be 0 bytes also.
+    char body[MAX_MSG_LEN - REQUEST_HEADER_LEN + 1];
+
+    if (request.length > 0) {
+        bytes_read = compsys_helper_readnb(&state, body, request.length);
+
+        if (bytes_read != (ssize_t)request.length) {
+            fprintf(stderr, "Failed to read request body! \n");
+            close(connfd);
+            return NULL;
+        }
+    }
+
+    // Extra terminator for debugging as text.
+    body[request.length] = '\0';
+
+    // Temporary output to verify that parsing works.
+    printf("Recieved request: \n");
+    printf("  IP: %s \n", sender_ip);
+    printf("  Port: %u \n", request.port);
+    printf("  Command: %u \n", request.command);
+    printf("  Body length: %u \n", request.length);
+
+    // TODO: Handle registration, retrieval an inform mesages
+    // to be added
+    
+    
+
     close(connfd);
-
-    /*
-    5: Reading Server Requests
-    Here we should probable actually read in some input data.
-    */
-
     return NULL;
+
+
 }
+
+//....................................................................................................
 
 /*
  * Function to act as basis for running the server thread. This thread will be
@@ -229,14 +321,7 @@ void* server_thread()
             free(connfd);
         }
     }
-
-
-
-
-
-
-
-    //-----------------------------------------------------------------------------------------------
+    //....................................................................................................
 
 
 
@@ -295,7 +380,7 @@ int main(int argc, char **argv)
     work out what our signature should be. 
     */
 
-    //----------------------------------------------------------------------------
+    //------------------------------------------------------------------------------------------
     get_signature(password, strlen(password), my_address->salt, my_address->signature);
 
 
@@ -308,7 +393,7 @@ int main(int argc, char **argv)
 
     printf("\n");
 
-    //----------------------------------------------------------------------------
+    //..........................................................................................
 
 
 
