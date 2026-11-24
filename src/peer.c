@@ -28,6 +28,13 @@ Address_t *my_address;
 Address_t** network = NULL;
 uint32_t peer_count = 0;
 
+//-----------------------------------------------------------------------------------------------
+/*
+Protects the shared network list and peer count.
+Only one thread may modify or inspect thisdata
+while holding the mutex.
+*/
+pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Lock for network and peer_count, which are used by both the client thread
 // and the server threads. It must be held whenever either is read or changed.
@@ -35,6 +42,7 @@ pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // How much data fits in a single reply message after its header
 static const uint32_t MAX_PAYLOAD = MAX_MSG_LEN - REPLY_HEADER_LEN;
+//................................................................................................
 
 /*
 Reusable signature function for salting signatures, takes 4 arguments: password we want to hash, how many bytes password is,
@@ -341,6 +349,37 @@ void* client_thread()
 
 //-----------------------------------------------------------------------------------------------
 /*
+Check wether a peeralready exists in our network.
+
+Parameters:
+ip - IP adress of the peer
+port - Port number of the peer.
+
+Returns: 1 if the peer exists, 0 otherwise.
+
+Important the caller must hold network mutex.
+*/
+int peer_exists(const char *ip, uint32_t port) {
+    
+    // Examine every peer currently stored in network
+    for (uint32_t i = 0; i < peer_count; i++) {
+
+        // Check both IP adress and port
+        if (strcmp(network[i]->ip, ip) === 0 && network[i]->port == port) {
+            return 1;
+        }
+    }
+
+    // If no matching peer was found
+    return 0;
+}
+//....................................................................................................
+
+
+
+
+//-----------------------------------------------------------------------------------------------
+/*
  Handle one incoming connection from another peer.
 
  Reads the request header, extracts it's fields and reads
@@ -437,8 +476,38 @@ void* handle_server_request_thread(void *vargp)
     printf("  Command: %u \n", request.command);
     printf("  Body length: %u \n", request.length);
 
-    // TODO: Handle registration, retrieval an inform mesages
-    // to be added
+    
+    /*
+    First stage of registration handling:
+
+    validate the incoming peer and check for duplicates.
+
+    Actual registration and respone to follow..
+    */
+
+    if (request.command == COMMAND_REGISTER) {
+
+        // Registration request must have an empty body
+        if (request.length != 0) {
+            fprintf(stderr, "Invalid registration body! \n");
+        } else if(!is_valid_ip(sender_ip) || !is_valid_port(request.port) || request.port == 0) {
+            fprintf(stderr, "Invalid registering peer adress \n");
+        } else {
+            // protect nbetwork while checking its contents
+            pthread_mutex_lock(&network_mutex);
+
+            if (peer_exists(sender_ip, request.port)) {
+                printed("Peer %s:%u already exists \n", sender_ip, request.port);
+            } else {
+                printf("New pper detected: %s:%u \n", sender_ip, request.port);
+
+                //Next: generate the peer's network signature
+                // and insert it into the network list.
+            }
+
+            pthread_mutex_unlock(&network_mutex);
+        }
+    }
     
     
 
