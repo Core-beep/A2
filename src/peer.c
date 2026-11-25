@@ -915,11 +915,8 @@ void* handle_server_request_thread(void *vargp)
 
                 printf("Registration response sent! \n");
 
-                printf("DEBUG: newly_registered = %d \n", newly_registered);
-
                 // Notify the existing network only about new peers.
                 if (newly_registered) {
-                    printf("DEBUG: Calling inform_existingP() \n");
 
                     inform_existingP(&new_peer_info);
                 }
