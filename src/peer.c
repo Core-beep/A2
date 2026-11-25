@@ -29,13 +29,6 @@ Address_t** network = NULL;
 uint32_t peer_count = 0;
 
 //-----------------------------------------------------------------------------------------------
-/*
-Protects the shared network list and peer count.
-Only one thread may modify or inspect thisdata
-while holding the mutex.
-*/
-pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 // Lock for network and peer_count, which are used by both the client thread
 // and the server threads. It must be held whenever either is read or changed.
 pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -44,32 +37,6 @@ pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 static const uint32_t MAX_PAYLOAD = MAX_MSG_LEN - REPLY_HEADER_LEN;
 //................................................................................................
 
-/*
-Reusable signature function for salting signatures, takes 4 arguments: password we want to hash, how many bytes password is,
- salt to combine with passwrd, where signature is stored (my_address).
-*/
-//-----------------------------------------------------------------------------------------------
-void get_signature(const char *password, int password_len, const char *salt, hashdata_t hash) {
-    char salted_input[2 * PASSWORD_LEN + 2 * SALT_LEN + 16];
-
-    int input_length = snprintf(
-        salted_input,
-        sizeof(salted_input),
-        "b'%.*s'b'%.*s'",
-        password_len, password,
-        SALT_LEN,
-        salt
-    );
-
-    if (input_length < 0 || (size_t)input_length >= sizeof(salted_input)) {
-        fprintf(stderr, "Failed to salt password!\n");
-        exit(EXIT_FAILURE);
-    }
-
-    get_data_sha(salted_input, hash, (uint32_t)input_length, SHA256_HASH_SIZE);
-}
-
-//................................................................................................
 
 /*
  * Find a peer in the network by its address. Returns NULL if it is not known.
@@ -179,6 +146,96 @@ uint32_t read_reply(compsys_helper_state_t *state, char **data,
 }
 
 
+//-----------------------------------------------------------------------------------------------
+/*
+Append a byte array using python's bytes representation.
+
+ex: hello -> b'hello'
+
+Binary bytes are escaped as needed.
+
+returns 1 on success, 0 if the buffer is too small.
+*/
+
+int append_python_bytes(char *out, size_t capacity, size_t *pos, const uint8_t *data, size_t length) {
+    const char hex[] = "0123456789abcdef";
+    int has_single = 0;
+    int has_double = 0;
+
+    // Python prefers double quotes when data contain single quotes but no double quotes.
+    for (size_t i = 0; i < length; i++) {
+        if (data[i] == '\'') has_single = 1;
+        if (data[i] == '"') has_double = 1;
+    }
+
+    char quote = (has_single && !has_double) ? '"' : '\'';
+
+    if (*pos + 2 >= capacity) return 0;
+    out[(*pos)++] = 'b';
+    out[(*pos)++] = quote;
+
+    for (size_t i = 0; i < length; i++) {
+        uint32_t c = data[i];
+        char escaped[4];
+        size_t n = 0;
+
+        if (c == '\\' || c == (uint8_t)quote) {
+            escaped[0] = '\\';
+            escaped[1] = c == '\n' ? 'n' : c == '\r' ? 'r' : 't';
+
+            n = 2;
+        } else if (c >= 32 && c <= 126) {
+            escaped[0] = (char)c;
+            n = 1;
+        } else {
+            escaped[0] = '\\';
+            escaped[1] = 'x';
+            escaped[2] = hex[c >> 4];
+            escaped[3] = hex[c & 15];
+            n = 4;
+        }
+
+        if (*pos + n + 1 >= capacity) return 0;
+        memcpy(out + *pos, escaped, n);
+        *pos += n;
+    }
+
+    out[(*pos)++] = quote;
+    out[*pos] = '\0';
+    return 1;
+}
+
+
+
+/*
+Generate a SHA-256 signature from data and a 16-byte salt.
+
+Parameters:
+data -     password or binary user signature.
+data_len - number of bytesn in data.
+salt -     16-byte salt.
+hash -     destination fot the resulting 32-byte hash.
+
+Matches the supplied python assemble_signature().
+*/
+
+void get_signature(const void *data, size_t data_len, const char *salt, hashdata_t hash) {
+    char salted_input[4 * (SHA256_HASH_SIZE + SALT_LEN) + 8];
+    size_t length = 0;
+
+    if (data_len > SHA256_HASH_SIZE || !append_python_bytes(salted_input, sizeof(salted_input), &length, data, data_len) || !append_python_bytes(salted_input, sizeof(salted_input), &length, (const uint8_t *)salt, SALT_LEN)){
+        fprintf(stderr, "Failed to construct salted input \n");
+        exit(EXIT_FAILURE);
+    }
+    
+    get_data_sha(salted_input, hash, (uint32_t)length, SHA256_HASH_SIZE);
+}
+
+//................................................................................................
+
+
+
+
 /*
  * Send a request message to another peer on the network. Unless this is 
  * specifically an 'inform' message as described in the assignment handout, a 
@@ -205,7 +262,7 @@ void send_message(Address_t peer_address, int command,
     // Construct a request message and send it to the peer
     struct RequestHeader request_header;
     strncpy(request_header.ip, my_address->ip, IP_LEN);
-    memcpy(my_address->signature, request_header.signature, SHA256_HASH_SIZE);
+    memcpy(request_header.signature, my_address->signature, SHA256_HASH_SIZE); // reversed header and adress. 
     request_header.port = htonl(my_address->port);
     request_header.command = htonl(command);
     request_header.length = htonl(body_length);
@@ -281,7 +338,7 @@ void send_message(Address_t peer_address, int command,
 void* client_thread()
 {
     char peer_ip[IP_LEN];
-    fprintf(stdout, "Enter peer IP to connect to: ");
+    fprintf(stdout, "Enter peer IP to connect to: \n ");
     scanf("%16s", peer_ip);
 
     // Clean up password string as otherwise some extra chars can sneak in.
@@ -291,7 +348,7 @@ void* client_thread()
     }
 
     char peer_port[PORT_STR_LEN];
-    fprintf(stdout, "Enter peer port to connect to: ");
+    fprintf(stdout, "Enter peer port to connect to: \n");
     scanf("%16s", peer_port);
 
     // Clean up password string as otherwise some extra chars can sneak in.
@@ -347,33 +404,109 @@ void* client_thread()
 }
 
 
-//-----------------------------------------------------------------------------------------------
+
 /*
-Check wether a peeralready exists in our network.
+Send a single-block response to another peer.
 
 Parameters:
-ip - IP adress of the peer
-port - Port number of the peer.
 
-Returns: 1 if the peer exists, 0 otherwise.
+connfd           - OPen socket to the requesting peer
+status           - Response status, such as STATUS_OK
+response_body    - Data to send after the header
+response_length  - Number of bytes in the body
 
-Important the caller must hold network mutex.
+The 80 byte reply header contains: 
+length, status, block number, number of blocks, block hash, total hash.
 */
-int peer_exists(const char *ip, uint32_t port) {
-    
-    // Examine every peer currently stored in network
-    for (uint32_t i = 0; i < peer_count; i++) {
 
-        // Check both IP adress and port
-        if (strcmp(network[i]->ip, ip) === 0 && network[i]->port == port) {
-            return 1;
-        }
+void send_response(int connfd, uint32_t status, const char *response_body, uint32_t response_length) {
+    //One message cannot exceed the maximum protocol size.
+    if (response_length > MAX_MSG_LEN - REPLY_HEADER_LEN) {
+        fprintf(stderr, "Response body too large! \n");
+        return;
     }
 
-    // If no matching peer was found
-    return 0;
+    ReplyHeader_t reply;
+
+    // Convert all numerical fields to network byte order
+    reply.length = htonl(response_length);
+    reply.status = htonl(status);
+
+    // This is the first and only block
+    reply.this_block = htonl(0);
+    reply.block_count = htonl(1);
+
+
+    /*
+    Calculate the SHA-256 chacksum of the response body.
+
+    Since we only send one block, the block hash and total has are identical.
+    */
+
+    get_data_sha(response_body, reply.block_hash, response_length, SHA256_HASH_SIZE);
+
+    memcpy(reply.total_hash, reply.block_hash, SHA256_HASH_SIZE);
+
+    // First send the fixed size reply header
+    compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN);
+
+    // Send the the variable length response body
+    if (response_length > 0) {
+        compsys_helper_writen(connfd, response_body, response_length);
+    }
+
+
 }
-//....................................................................................................
+
+
+
+/*
+Create body of a registration respone
+
+Each peer occupies PEER_ADDR_LEN (68) bytes
+
+the caller must hold network_mutex because ths function reads the shared network list.
+
+returns number of bytes written, or -1 if the complete network doesn't fit in one block
+*/
+
+int build_network_response(char *buffer, size_t capacity) {
+    size_t position = 0;
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+
+        Address_t *peer = network[i];
+
+        // Check that next entry fits in the buffer
+        if (capacity - position < PEER_ADDR_LEN) {
+            return -1;
+        }
+
+
+        // 16 bytes: IP adress
+        memcpy(buffer + position, peer->ip, IP_LEN);
+        position += IP_LEN;
+
+        // 4 bytes: port in network byte order
+        uint32_t port = htonl(peer-> port);
+        memcpy(buffer + position, &port, PORT_LEN);
+        position += PORT_LEN;
+
+        // 32 bytes: network signature
+        memcpy(buffer + position, peer->signature, SHA256_HASH_SIZE);
+        position += SHA256_HASH_SIZE;
+
+        // 16 bytes: salt.
+        memcpy(buffer + position, peer->salt, SALT_LEN);
+        position += SALT_LEN;
+    }
+
+    return (int)position;
+}
+
+
+
+
 
 
 
@@ -487,34 +620,90 @@ void* handle_server_request_thread(void *vargp)
 
     if (request.command == COMMAND_REGISTER) {
 
-        // Registration request must have an empty body
-        if (request.length != 0) {
-            fprintf(stderr, "Invalid registration body! \n");
-        } else if(!is_valid_ip(sender_ip) || !is_valid_port(request.port) || request.port == 0) {
-            fprintf(stderr, "Invalid registering peer adress \n");
+        // A registration request must have an empty body
+        // and contain a valid peer adress
+        if (request.length != 0 || !is_valid_ip(sender_ip) || !is_valid_port(request.port) || request.port == 0) {
+
+            fprintf(stderr, "Invalid registration request \n");
+            const char *error = "invalid registration request";
+
+            send_response(connfd, STATUS_BAD_REQUEST, error, (uint32_t)strlen(error));
         } else {
-            // protect nbetwork while checking its contents
+            
+            /*
+            Generate the network salt and signature.
+
+            The recieved user signature us hashed again using a new salt before 
+            being stored in the network list
+            */
+            char network_salt[SALT_LEN];
+            hashdata_t network_signature;
+
+            generate_random_salt(network_salt); // from common,
+
+            get_signature(request.signature, SHA256_HASH_SIZE, network_salt, network_signature);
+
+            /*
+            Lock network while checking and adding peers.
+            This prevents two threads from registering the same peer simultaneously.
+            */
             pthread_mutex_lock(&network_mutex);
 
-            if (peer_exists(sender_ip, request.port)) {
-                printed("Peer %s:%u already exists \n", sender_ip, request.port);
+            // find_peer() returns NULL if the peer is not known.
+            if (find_peer(sender_ip, request.port) != NULL) {
+                printf("Peer %s:%u alreday in network \n", sender_ip, request.port);
             } else {
-                printf("New pper detected: %s:%u \n", sender_ip, request.port);
-
-                //Next: generate the peer's network signature
-                // and insert it into the network list.
+                /*
+                add peer using helper function add_pper()
+                */
+                add_peer(sender_ip, request.port, network_signature, network_salt);
+                printf("Registered peer %s:%u \n", sender_ip, request.port);
+                printf("Network now contains %u peers! \n", peer_count);
             }
 
             pthread_mutex_unlock(&network_mutex);
+
+
+            char response_body[MAX_MSG_LEN - REPLY_HEADER_LEN];
+            int response_length;
+            uint32_t status = STATUS_OK;
+
+            // Protect both the registration and network 
+            pthread_mutex_lock(&network_mutex);
+
+            if (find_peer(sender_ip, request.port) != NULL) {
+                printf("Peer %S:%u already exists. \n", sender_ip, request.port);
+
+                status = STATUS_PEER_EXISTS;
+
+            } else {
+                add_peer(sender_ip, request.port, network_signature, network_salt);
+
+                printf("Registered peer %s:%u \n", sender_ip, request.port);
+            }
+
+            // COPy the complete network into the response buffer.
+            response_length = build_network_response(response_body, sizeof(response_body));
+            
+            pthread_mutex_unlock(&network_mutex);
+
+
+
+            /*
+            Send the response after releasing the mutex.
+            Socket operations can block so we don't want to hold network lock while sending.
+            */
+            if (response_length >= 0) {
+                send_response(connfd, status, response_body, (uint32_t)response_length);
+
+                printf("Registration response sent! \n");
+            } else {
+                const char *error = "Network list too large!";
+
+                send_response(connfd, STATUS_OTHER, error, (uint32_t)strlen(error));
+            }
         }
     }
-    
-    
-
-    close(connfd);
-    return NULL;
-
-
 }
 
 //....................................................................................................
