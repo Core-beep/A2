@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -257,6 +258,12 @@ void send_message(Address_t peer_address, int command,
     port_char[5] = '\0';
     sprintf(port_char, "%d", peer_address.port);
     int peer_socket = compsys_helper_open_clientfd(peer_address.ip, port_char);
+
+    if (peer_socket < 0) {
+        fprintf(stderr, "Could not connect to peer %s:%u \n", peer_address.ip, peer_address.port);
+        return;
+    }
+
     compsys_helper_readinitb(&state, peer_socket);
 
     // Construct a request message and send it to the peer
@@ -461,6 +468,133 @@ void send_response(int connfd, uint32_t status, const char *response_body, uint3
 
 
 /*
+Handle s amall file retrieval request.
+
+Only files inside the peer's current working directory
+can be served. FIles must fit in one response block
+
+Parameters:
+
+connfd  - Socket connected to the requestin gpeer.
+body    - Request body containing the filename.
+length  - Number of bytes in the request body.
+*/
+
+void handle_retrieve(int connfd, const char *body, uint32_t length){
+
+    char filename[PATH_LEN];
+    char root[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    // ensure the filename is present and fist in our buffer.
+    if (length == 0 || length >= PATH_LEN || memchr(body, '\0', length) != NULL) {
+        const char *error = "Invalid filename! \n";
+        send_response(connfd, STATUS_BAD_REQUEST, error, strlen(error));
+
+        return;
+    }
+
+    // Make a null terminated copy of the filename.
+    memcpy(filename, body, length);
+    filename[length] = '\0';
+
+    // Only accept relative paths
+    if (filename[0] == '/') {
+        const char *error = "Absolute paths not allowed! \n";
+        send_response(connfd, STATUS_BAD_REQUEST, error, strlen(error));
+
+        return;
+    }
+
+
+    /*
+    Find the files actual location
+
+    realpath() also resolves ../ and symbolic lnks
+    so we can check that he file stays in our directory
+    */
+
+    if (realpath(".", root) == NULL || realpath(filename, resolved) == NULL) {
+        const char *error = "File not found.. \n";
+        send_response(connfd, STATUS_BAD_REQUEST, error, strlen(error));
+
+        return;
+    }
+
+
+    // ensure the resolved path is inside our directory.
+    size_t root_len = strlen(root);
+
+    if (strncmp(resolved, root, root_len) != 0 || (resolved[root_len] != '/' && !(root_len == 1 && root[0] == '/'))) {
+        const char *error = "Access denied! \n";
+        send_response(connfd, STATUS_BAD_REQUEST, error, strlen(error));
+
+        return;
+    }
+
+    // OPen the file in binary mode.
+    FILE *fp = fopen(resolved, "rb");
+
+    if (fp == NULL) {
+        const char *error = "Cannot open file.. \n";
+        send_response(connfd, STATUS_BAD_REQUEST, error, strlen(error));
+
+        return;
+    }
+
+    // Determine file size
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        send_response(connfd, STATUS_OTHER, "Cannot read file! \n", 16);
+        
+        return;
+    }
+
+
+    long file_size = ftell(fp);
+
+    // A single reply contains at most this many data bytes.
+    const size_t max_payload = MAX_MSG_LEN - REPLY_HEADER_LEN;
+
+    if ( file_size < 0 || (unsigned long)file_size > max_payload) {
+        fclose(fp);
+        const char *error = "File too large \n";
+        send_response(connfd, STATUS_OTHER, error, strlen(error));
+
+        return;
+    }
+
+    rewind(fp);
+
+    // Read the file contents into memory.
+    char file_data[MAX_MSG_LEN - REPLY_HEADER_LEN];
+
+    size_t bytes_read = fread(file_data, 1, (size_t)file_size, fp);
+
+    fclose(fp);
+
+    if (bytes_read != (size_t)file_size) {
+        const char *error = "Failed to read file! \n";
+        send_response(connfd, STATUS_OTHER, error, strlen(error));
+
+        return;
+    }
+
+    // Send the file contents with a successfull status
+    send_response(connfd, STATUS_OK, file_data, (uint32_t)bytes_read);
+
+    printf("Served file: %s (%zu bytes) \n", filename, bytes_read);
+
+
+}
+
+
+
+
+
+
+
+/*
 Create body of a registration respone
 
 Each peer occupies PEER_ADDR_LEN (68) bytes
@@ -504,6 +638,94 @@ int build_network_response(char *buffer, size_t capacity) {
     return (int)position;
 }
 
+
+
+
+/*
+Inform all existing peer about the newly registered peer
+
+New peer's adress, network signature and salt
+must be sent in the 68 byte INFORM requst body
+
+must not contact itself or the new peer
+must not hold network mutex while sending messages.
+*/
+
+void inform_existingP(const Address_t *new_peer) {
+    char inform_body[PEER_ADDR_LEN];
+    size_t position = 0;
+
+    // Build the 68 byte INFORM body
+    memcpy(inform_body + position, new_peer->ip, IP_LEN);
+    position += IP_LEN;
+
+    uint32_t port = htonl(new_peer->port);
+    memcpy(inform_body + position, &port, PORT_LEN);
+    position += PORT_LEN;
+
+    memcpy(inform_body + position, new_peer->signature, SHA256_HASH_SIZE);
+    position += SHA256_HASH_SIZE;
+
+    memcpy(inform_body + position, new_peer->salt, SALT_LEN);
+
+    /*
+    COpy the recipients while holding the mutex
+
+    must not keep pointers into network because
+    another thread could resize the network array.
+    */
+
+    pthread_mutex_lock(&network_mutex);
+
+    Address_t *recipients = calloc(peer_count, sizeof(Address_t));
+
+    if (recipients == NULL) {
+        pthread_mutex_unlock(&network_mutex);
+        fprintf(stderr, "Could not allocate INFORM recipients \n");
+        return;
+    }
+
+    uint32_t recipient_count = 0;
+    const char empty_salt[SALT_LEN] = {0};
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+        Address_t *peer = network[i];
+
+        // Don't inform self
+        if (strcmp(peer->ip, my_address->ip) == 0 && peer->port == my_address->port) {
+            continue;
+        }
+
+        // Don't inform the newly registered peer.
+        if (strcmp(peer->ip, new_peer->ip) == 0 && peer->port == new_peer->port) {
+            continue;
+        }
+
+        // Skip peers with no stored network salt.
+        if (memcmp(peer->salt, empty_salt, SALT_LEN) == 0) {
+            continue;
+        }
+
+        // Copy the entry instead of keeping a shared pointer
+        recipients[recipient_count++] = *peer;
+    }
+
+    pthread_mutex_unlock(&network_mutex);
+
+
+    /*
+    Send each INFORM without holding the mutex.
+    Socket operations may block
+    */
+    for (uint32_t i = 0; i < recipient_count; i++) {
+        printf("Informing %s:%u about %s:%u \n", recipients[i].ip, recipients[i].port, new_peer->ip, new_peer->port);
+
+        send_message(recipients[i], COMMAND_INFORM, inform_body, PEER_ADDR_LEN);
+
+    }
+
+    free(recipients);
+}
 
 
 
@@ -643,36 +865,23 @@ void* handle_server_request_thread(void *vargp)
 
             get_signature(request.signature, SHA256_HASH_SIZE, network_salt, network_signature);
 
-            /*
-            Lock network while checking and adding peers.
-            This prevents two threads from registering the same peer simultaneously.
-            */
-            pthread_mutex_lock(&network_mutex);
-
-            // find_peer() returns NULL if the peer is not known.
-            if (find_peer(sender_ip, request.port) != NULL) {
-                printf("Peer %s:%u alreday in network \n", sender_ip, request.port);
-            } else {
-                /*
-                add peer using helper function add_pper()
-                */
-                add_peer(sender_ip, request.port, network_signature, network_salt);
-                printf("Registered peer %s:%u \n", sender_ip, request.port);
-                printf("Network now contains %u peers! \n", peer_count);
-            }
-
-            pthread_mutex_unlock(&network_mutex);
-
 
             char response_body[MAX_MSG_LEN - REPLY_HEADER_LEN];
             int response_length;
             uint32_t status = STATUS_OK;
 
             // Protect both the registration and network 
+            
+            // Remember wether this is genuinly a new registration
+            int newly_registered = 0;
+            //Local copy of the pee we may need to announce
+            Address_t new_peer_info;
+
+
             pthread_mutex_lock(&network_mutex);
 
             if (find_peer(sender_ip, request.port) != NULL) {
-                printf("Peer %S:%u already exists. \n", sender_ip, request.port);
+                printf("Peer %s:%u already exists. \n", sender_ip, request.port);
 
                 status = STATUS_PEER_EXISTS;
 
@@ -680,6 +889,14 @@ void* handle_server_request_thread(void *vargp)
                 add_peer(sender_ip, request.port, network_signature, network_salt);
 
                 printf("Registered peer %s:%u \n", sender_ip, request.port);
+
+                // Keep copy to use after releasing the mutex.
+                Address_t *added = find_peer(sender_ip, request.port);
+
+                if (added != NULL) {
+                    new_peer_info = *added;
+                    newly_registered = 1;
+                }
             }
 
             // COPy the complete network into the response buffer.
@@ -697,13 +914,70 @@ void* handle_server_request_thread(void *vargp)
                 send_response(connfd, status, response_body, (uint32_t)response_length);
 
                 printf("Registration response sent! \n");
+
+                printf("DEBUG: newly_registered = %d \n", newly_registered);
+
+                // Notify the existing network only about new peers.
+                if (newly_registered) {
+                    printf("DEBUG: Calling inform_existingP() \n");
+
+                    inform_existingP(&new_peer_info);
+                }
             } else {
                 const char *error = "Network list too large!";
 
                 send_response(connfd, STATUS_OTHER, error, (uint32_t)strlen(error));
             }
         }
+    } else if (request.command == COMMAND_RETREIVE) {
+        handle_retrieve(connfd, body, request.length);
+    } else if (request.command == COMMAND_INFORM) {
+        /*
+        INFORM contains exactly one peer adress: (16 bytes IP) + (4 port) + (32 signature) + (16 salt).
+        */
+        if (request.length != PEER_ADDR_LEN) {
+            fprintf(stderr, "Invalid inform body length. \n");
+        } else {
+            //Extract the peer being announced
+            char new_ip[IP_LEN + 1];
+
+            memcpy(new_ip, body, IP_LEN);
+            new_ip[IP_LEN] = '\0';
+
+            uint32_t network_port;
+            memcpy(&network_port, body + IP_LEN, PORT_LEN);
+            network_port = ntohl(network_port);
+
+            hashdata_t network_signature;
+            memcpy(network_signature, body + IP_LEN + PORT_LEN, SHA256_HASH_SIZE);
+
+            char network_salt[SALT_LEN];
+            memcpy(network_salt, body + IP_LEN + PORT_LEN +SHA256_HASH_SIZE, SALT_LEN);
+
+            // VAlidate the new peer adress
+            if (strnlen(new_ip, IP_LEN) == IP_LEN || !is_valid_ip(new_ip) || !is_valid_port(network_port) || network_port ==0) {
+
+                fprintf(stderr, "Invalid peer in INFORM \n");
+            } else {
+                // Protect the shared network whhile updating it.
+                pthread_mutex_lock(&network_mutex);
+
+                if (find_peer(new_ip, network_port) == NULL) {
+                    add_peer(new_ip, network_port, network_signature, network_salt);
+
+                    printf("Added new peer: %s:%u \n", new_ip, network_port);
+                    printf("Network now contains %u peers! \n", peer_count);
+                } else {
+                    printf("INFORM: peer %s:%u already in network! \n", new_ip, network_port);
+                }
+
+                pthread_mutex_unlock(&network_mutex);
+            }
+        }
     }
+
+    close(connfd);
+    return NULL;
 }
 
 //....................................................................................................
